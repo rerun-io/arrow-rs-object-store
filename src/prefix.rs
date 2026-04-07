@@ -304,6 +304,7 @@ mod tests {
         let store = PrefixStore::new(InMemory::new(), "prefix");
 
         multipart(&store, &store).await;
+        multipart_put_part_out_of_order(&store, &store).await;
         multipart_out_of_order(&store).await;
         multipart_race_condition(&store, true).await;
     }

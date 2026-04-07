@@ -1052,6 +1052,56 @@ pub async fn multipart(storage: &dyn ObjectStore, multipart: &dyn MultipartStore
     assert_eq!(meta.size, 0);
 }
 
+/// Tests that [`MultipartStore::put_part`] may be invoked with non-sequential part indices.
+pub async fn multipart_put_part_out_of_order(
+    storage: &dyn ObjectStore,
+    multipart: &dyn MultipartStore,
+) {
+    let path = Path::from("test_multipart_put_part_out_of_order");
+
+    // S3: each part except the last must be ≥ 5 MiB.
+    const MIN_MULTIPART_PART: usize = 5 * 1024 * 1024;
+    let part0_data = Bytes::from(vec![0xAA_u8; MIN_MULTIPART_PART]);
+    let part1_data = Bytes::from(vec![0xBB_u8; MIN_MULTIPART_PART]);
+    let part2_data = Bytes::from_static(b"tail");
+
+    let upload_id = multipart.create_multipart(&path).await.unwrap();
+
+    let part2 = multipart
+        .put_part(&path, &upload_id, 2, PutPayload::from(part2_data.clone()))
+        .await
+        .unwrap();
+
+    let part0 = multipart
+        .put_part(&path, &upload_id, 0, PutPayload::from(part0_data.clone()))
+        .await
+        .unwrap();
+
+    let part1 = multipart
+        .put_part(&path, &upload_id, 1, PutPayload::from(part1_data.clone()))
+        .await
+        .unwrap();
+
+    let result = multipart
+        .complete_multipart(&path, &upload_id, vec![part0, part1, part2])
+        .await
+        .unwrap();
+    assert!(result.e_tag.is_some(), "Expected e_tag in PutResult");
+
+    let data = storage.get(&path).await.unwrap().bytes().await.unwrap();
+    assert_eq!(
+        data.len(),
+        part0_data.len() + part1_data.len() + part2_data.len()
+    );
+    assert!(data[..MIN_MULTIPART_PART].iter().all(|&b| b == 0xAA));
+    assert!(
+        data[MIN_MULTIPART_PART..2 * MIN_MULTIPART_PART]
+            .iter()
+            .all(|&b| b == 0xBB)
+    );
+    assert_eq!(&data[2 * MIN_MULTIPART_PART..], part2_data.as_ref());
+}
+
 async fn delete_fixtures(storage: &DynObjectStore) {
     let paths = storage.list(None).map_ok(|meta| meta.location).boxed();
     storage

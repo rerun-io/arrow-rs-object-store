@@ -433,7 +433,7 @@ impl MultipartStore for InMemory {
     ) -> Result<PartId> {
         let mut storage = self.storage.write();
         let upload = storage.upload_mut(id)?;
-        if part_idx <= upload.parts.len() {
+        if part_idx >= upload.parts.len() {
             upload.parts.resize(part_idx + 1, None);
         }
         upload.parts[part_idx] = Some(payload.into());
@@ -558,6 +558,7 @@ mod tests {
         put_opts(&integration, true).await;
         multipart(&integration, &integration).await;
         put_get_attributes(&integration).await;
+        multipart_put_part_out_of_order(&integration, &integration).await;
     }
 
     #[tokio::test]
