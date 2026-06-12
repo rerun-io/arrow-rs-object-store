@@ -869,11 +869,13 @@ mod tests {
     use crate::aws::{AmazonS3Builder, AmazonS3ConfigKey};
     use crate::client::HttpClient;
     use crate::client::mock_server::MockServer;
-    use http::Response;
-    use reqwest::{Client, Method};
+    use http::{Method, Response};
+    #[cfg(feature = "reqwest")]
+    use reqwest::Client;
     use std::env;
 
     // Test generated using https://docs.aws.amazon.com/general/latest/gr/sigv4-signed-request-examples.html
+    #[cfg(feature = "reqwest")]
     #[test]
     fn test_sign_with_signed_payload() {
         let client = HttpClient::new(Client::new());
@@ -1009,6 +1011,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "reqwest")]
     #[test]
     fn test_sign_with_unsigned_payload() {
         let client = HttpClient::new(Client::new());
@@ -1136,6 +1139,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "reqwest")]
     #[test]
     fn test_sign_port() {
         let client = HttpClient::new(Client::new());
@@ -1179,6 +1183,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "reqwest")]
     #[tokio::test]
     async fn test_instance_metadata() {
         if env::var("TEST_INTEGRATION").is_err() {
@@ -1217,6 +1222,7 @@ mod tests {
         assert!(!token.is_empty())
     }
 
+    #[cfg(feature = "reqwest")]
     #[tokio::test]
     async fn test_mock() {
         let server = MockServer::new().await;
@@ -1310,6 +1316,7 @@ mod tests {
             .unwrap_err();
     }
 
+    #[cfg(feature = "reqwest")]
     #[tokio::test]
     async fn test_eks_pod_credential_provider() {
         use crate::client::mock_server::MockServer;

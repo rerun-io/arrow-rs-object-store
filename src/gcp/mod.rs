@@ -408,6 +408,7 @@ mod test {
         response_extensions(&integration, test_multipart).await;
     }
 
+    #[cfg(feature = "reqwest")]
     #[tokio::test]
     #[ignore]
     async fn gcs_test_sign() {

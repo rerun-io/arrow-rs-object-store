@@ -1484,6 +1484,7 @@ mod tests {
         assert_eq!(delegation_key_expiry(&key, requested), requested);
     }
 
+    #[cfg(feature = "reqwest")]
     #[tokio::test]
     async fn test_build_bulk_delete_body() {
         let credential_provider = Arc::new(StaticCredentialProvider::new(
