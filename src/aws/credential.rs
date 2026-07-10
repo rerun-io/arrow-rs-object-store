@@ -25,7 +25,7 @@ use crate::{CredentialProvider, Result, RetryConfig};
 use async_trait::async_trait;
 use bytes::Buf;
 use chrono::{DateTime, Utc};
-use http::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
+use http::header::{AUTHORIZATION, HOST, HeaderMap, HeaderName, HeaderValue};
 use http::{Method, StatusCode};
 use percent_encoding::utf8_percent_encode;
 use serde::Deserialize;
@@ -179,10 +179,6 @@ impl<'a> AwsAuthorizer<'a> {
             request.headers_mut().insert(header, token_val);
         }
 
-        let host = &url[url::Position::BeforeHost..url::Position::AfterPort];
-        let host_val = HeaderValue::from_str(host).unwrap();
-        request.headers_mut().insert("host", host_val);
-
         let date = self.date.unwrap_or_else(Utc::now);
         let date_str = date.format("%Y%m%dT%H%M%SZ").to_string();
         let date_val = HeaderValue::from_str(&date_str).unwrap();
@@ -214,7 +210,15 @@ impl<'a> AwsAuthorizer<'a> {
                 .insert(&REQUEST_PAYER_HEADER, REQUEST_PAYER_HEADER_VALUE.clone());
         }
 
+        // the SigV4 must include a value for `host`, but the actual Host header may need to change
+        // due to a redirect. Therefore do not override the Host header for the http
+        // request, let the client set it.
+        let host = &url[url::Position::BeforeHost..url::Position::AfterPort];
+        request
+            .headers_mut()
+            .insert(&HOST, HeaderValue::from_str(host).unwrap());
         let (signed_headers, canonical_headers) = canonicalize_headers(request.headers());
+        request.headers_mut().remove(&HOST);
 
         let scope = self.scope(date);
 
@@ -914,6 +918,53 @@ mod tests {
         )
     }
 
+    /// `host` must be part of the SigV4 signature, but must NOT be pinned as a header on the
+    /// request itself — the transport (hyper) sets Host from the URL, so a pinned Host header
+    /// would be carried onto a cross-host redirect (e.g. an S3-compatible gateway 302 to a CDN)
+    /// and break the redirected request.
+    #[cfg(feature = "reqwest")]
+    #[test]
+    fn test_host_is_signed_but_not_pinned_on_request() {
+        let client = HttpClient::new(Client::new());
+        let credential = AwsCredential {
+            key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
+            secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+            token: None,
+        };
+        let date = DateTime::parse_from_rfc3339("2022-08-06T18:01:34Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut request = client
+            .request(Method::GET, "https://ec2.amazon.com/")
+            .into_parts()
+            .1
+            .unwrap();
+        let signer = AwsAuthorizer {
+            date: Some(date),
+            crypto: None,
+            credential: &credential,
+            service: "ec2",
+            region: "us-east-1",
+            sign_payload: true,
+            token_header: None,
+            request_payer: false,
+        };
+
+        signer.try_authorize(&mut request, None).unwrap();
+
+        // host is signed ...
+        let auth = request
+            .headers()
+            .get(&AUTHORIZATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(auth.contains("SignedHeaders=host;"), "auth was: {auth}");
+        // ... but not pinned as a request header (so it is regenerated across redirects).
+        assert!(request.headers().get(&HOST).is_none());
+    }
+
+    #[cfg(feature = "reqwest")]
     #[test]
     fn test_sign_with_signed_payload_request_payer() {
         let client = HttpClient::new(Client::new());
