@@ -286,6 +286,42 @@ impl Signer for GoogleCloudStorage {
 
         Ok(url)
     }
+
+    async fn signed_urls(
+        &self,
+        method: Method,
+        paths: &[Path],
+        expires_in: Duration,
+    ) -> Result<Vec<Url>> {
+        let mut urls = Vec::with_capacity(paths.len());
+
+        if expires_in.as_secs() > 604800 {
+            return Err(crate::Error::Generic {
+                store: STORE,
+                source: "Expiration Time can't be longer than 604800 seconds (7 days).".into(),
+            });
+        }
+
+        let signing_credentials = self.signing_credentials().get_credential().await?;
+        let authorizer = GCSAuthorizer::new(signing_credentials);
+
+        let config = self.client.config();
+
+        for path in paths {
+            let path_url = config.path_url(path);
+            let mut url = Url::parse(&path_url).map_err(|e| crate::Error::Generic {
+                store: STORE,
+                source: format!("Unable to parse url {path_url}: {e}").into(),
+            })?;
+
+            authorizer
+                .sign(method.clone(), &mut url, expires_in, &self.client)
+                .await?;
+            urls.push(url);
+        }
+
+        Ok(urls)
+    }
 }
 
 #[async_trait]
