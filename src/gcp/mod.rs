@@ -34,7 +34,7 @@
 //! enabled by setting [crate::ClientConfigKey::Http1Only] to false.
 //!
 //! [lifecycle rule]: https://cloud.google.com/storage/docs/lifecycle#abort-mpu
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use crate::client::CredentialProvider;
@@ -48,7 +48,8 @@ use crate::{
 };
 use async_trait::async_trait;
 use client::GoogleCloudStorageClient;
-use futures_util::stream::{BoxStream, StreamExt};
+use futures_util::TryStreamExt;
+use futures_util::stream::{self, BoxStream, StreamExt};
 use http::Method;
 use url::Url;
 
@@ -285,6 +286,56 @@ impl Signer for GoogleCloudStorage {
             .await?;
 
         Ok(url)
+    }
+
+    async fn signed_urls(
+        &self,
+        method: Method,
+        paths: &[Path],
+        expires_in: Duration,
+    ) -> Result<Vec<Url>> {
+        if expires_in.as_secs() > 604800 {
+            return Err(crate::Error::Generic {
+                store: STORE,
+                source: "Expiration Time can't be longer than 604800 seconds (7 days).".into(),
+            });
+        }
+
+        let signing_credentials = self.signing_credentials().get_credential().await?;
+        let authorizer = GCSAuthorizer::new(signing_credentials);
+
+        let config = self.client.config();
+
+        static PARALLELISM: LazyLock<usize> = LazyLock::new(|| {
+            std::env::var("OBJECT_STORE_GCP_SIGNER_PARALLELISM")
+                .map(|value| value.parse().expect("Invalid parallelism value"))
+                .unwrap_or(64)
+        });
+
+        let client = &self.client;
+
+        let path_urls: Vec<String> = paths.iter().map(|path| config.path_url(path)).collect();
+        let authorizer = &authorizer;
+        let method = &method;
+
+        let urls = stream::iter(path_urls)
+            .map(|path_url| async move {
+                let mut url = Url::parse(&path_url).map_err(|e| crate::Error::Generic {
+                    store: STORE,
+                    source: format!("Unable to parse url {path_url}: {e}").into(),
+                })?;
+
+                authorizer
+                    .sign(method.clone(), &mut url, expires_in, client)
+                    .await?;
+
+                Ok::<_, crate::Error>(url)
+            })
+            .buffered(*PARALLELISM)
+            .try_collect()
+            .await?;
+
+        Ok(urls)
     }
 }
 
