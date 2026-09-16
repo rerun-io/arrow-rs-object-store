@@ -236,6 +236,10 @@ impl Signer for MicrosoftAzure {
         }
         Ok(urls)
     }
+
+    fn path_url(&self, path: &Path) -> Result<Url> {
+        Ok(self.path_url(path))
+    }
 }
 
 /// Relevant docs: <https://azure.github.io/Storage/docs/application-and-user-data/basics/azure-blob-storage-upload-apis/>
