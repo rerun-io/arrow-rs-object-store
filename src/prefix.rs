@@ -249,6 +249,10 @@ impl<T: MultipartStore> MultipartStore for PrefixStore<T> {
 #[cfg(feature = "cloud-base")]
 #[async_trait::async_trait]
 impl<T: Signer> Signer for PrefixStore<T> {
+    fn path_url(&self, path: &Path) -> Result<url::Url> {
+        self.inner.path_url(&self.full_path(path))
+    }
+
     async fn signed_url(
         &self,
         method: http::Method,
@@ -427,6 +431,10 @@ mod tests {
 
         #[async_trait::async_trait]
         impl Signer for Foo {
+            fn path_url(&self, path: &Path) -> Result<url::Url> {
+                Ok(url::Url::parse(&format!("ex:{path}")).unwrap())
+            }
+
             async fn signed_url(
                 &self,
                 method: http::Method,
@@ -458,6 +466,12 @@ mod tests {
                 .await
                 .unwrap(),
             vec![url::Url::parse("ex:prefix/foo?method=GET").unwrap()]
+        );
+        assert_eq!(
+            PrefixStore::new(PrefixStore::new(Foo, "outer"), "inner")
+                .path_url(&"foo".into())
+                .unwrap(),
+            url::Url::parse("ex:outer/inner/foo").unwrap()
         );
     }
 }
