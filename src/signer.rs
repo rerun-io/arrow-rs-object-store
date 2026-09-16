@@ -17,7 +17,7 @@
 
 //! Abstraction of signed URL generation for those object store implementations that support it
 
-use crate::{Result, path::Path};
+use crate::{Error, Result, path::Path};
 use async_trait::async_trait;
 use reqwest::Method;
 use std::{fmt, time::Duration};
@@ -46,5 +46,12 @@ pub trait Signer: Send + Sync + fmt::Debug + 'static {
             urls.push(self.signed_url(method.clone(), path, expires_in).await?);
         }
         Ok(urls)
+    }
+
+    /// Generate an unsigned HTTP URL for the given path.
+    fn path_url(&self, _path: &Path) -> Result<Url> {
+        Err(Error::NotSupported {
+            source: "Not implemented for this signer".into(),
+        })
     }
 }

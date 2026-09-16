@@ -337,6 +337,16 @@ impl Signer for GoogleCloudStorage {
 
         Ok(urls)
     }
+
+    fn path_url(&self, path: &Path) -> Result<Url> {
+        let config = self.client.config();
+        let path_url = config.path_url(path);
+        let url = Url::parse(&path_url).map_err(|e| crate::Error::Generic {
+            store: STORE,
+            source: format!("Unable to parse url {path_url}: {e}").into(),
+        })?;
+        Ok(url)
+    }
 }
 
 #[async_trait]
