@@ -55,7 +55,7 @@ use async_trait::async_trait;
 use client::GoogleCloudStorageClient;
 use futures_util::TryStreamExt;
 use futures_util::stream::{self, BoxStream, StreamExt};
-use http::Method;
+use http::{HeaderMap, Method};
 use url::Url;
 
 use crate::client::get::GetClientExt;
@@ -435,7 +435,15 @@ impl Signer for GoogleCloudStorage {
                 })?;
 
                 authorizer
-                    .sign(method.clone(), &mut url, expires_in, client)
+                    .sign_with(
+                        crypto_provider(client.config().crypto.as_deref())?,
+                        method.clone(),
+                        &mut url,
+                        &[],
+                        &HeaderMap::new(),
+                        expires_in,
+                        client,
+                    )
                     .await?;
 
                 Ok::<_, crate::Error>(url)
