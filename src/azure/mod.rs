@@ -187,6 +187,11 @@ impl Signer for MicrosoftAzure {
     /// Create a URL containing the relevant [Service SAS] query parameters that authorize a request
     /// via `method` to the resource at `path` valid for the duration specified in `expires_in`.
     ///
+    /// Azure uses the default implementation of [`Signer::signed_url_opts`], which rejects
+    /// nonempty options. SAS signs fixed permission and resource fields, not arbitrary query
+    /// parameters or headers. For block uploads, append `comp=block` and `blockid` to the URL
+    /// returned by [`Signer::signed_url`].
+    ///
     /// [Service SAS]: https://learn.microsoft.com/en-us/rest/api/storageservices/create-service-sas
     ///
     /// # Example

@@ -41,8 +41,8 @@ use crate::client::CredentialProvider;
 use crate::client::get::GetClientExt;
 use crate::client::list::{ListClient, ListClientExt};
 use crate::multipart::{MultipartStore, PartId};
-use crate::signer::Signer;
-use crate::util::STRICT_ENCODE_SET;
+use crate::signer::{SignedUrlOptions, Signer};
+use crate::util::{STRICT_ENCODE_SET, validate_signed_url_extras};
 use crate::{
     CopyMode, CopyOptions, Error, GetOptions, GetResult, ListResult, MultipartId, MultipartUpload,
     ObjectMeta, ObjectStore, Path, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
@@ -138,6 +138,24 @@ impl Signer for AmazonS3 {
     /// # }
     /// ```
     async fn signed_url(&self, method: Method, path: &Path, expires_in: Duration) -> Result<Url> {
+        self.signed_url_opts(method, path, expires_in, &SignedUrlOptions::default())
+            .await
+    }
+
+    async fn signed_url_opts(
+        &self,
+        method: Method,
+        path: &Path,
+        expires_in: Duration,
+        options: &SignedUrlOptions,
+    ) -> Result<Url> {
+        validate_signed_url_extras(
+            STORE,
+            &options.extra_query,
+            &options.signed_headers,
+            "x-amz-",
+        )?;
+
         let credential = self.credentials().get_credential().await?;
         let authorizer = AwsAuthorizer::new(&credential, "s3", &self.client.config.region)
             .with_request_payer(self.client.config.request_payer);
@@ -148,7 +166,13 @@ impl Signer for AmazonS3 {
             source: format!("Unable to parse url {path_url}: {e}").into(),
         })?;
 
-        authorizer.sign(method, &mut url, expires_in);
+        authorizer.sign_with(
+            method,
+            &mut url,
+            &options.extra_query,
+            &options.signed_headers,
+            expires_in,
+        )?;
 
         Ok(url)
     }
@@ -469,6 +493,48 @@ impl MultipartUpload for S3MultiPartUpload {
 
 #[async_trait]
 impl MultipartStore for AmazonS3 {
+    /// Start an upload whose parts can be uploaded through presigned URLs.
+    ///
+    /// The credential holder creates and completes the upload. A client without credentials
+    /// uploads each part and returns its ETag. Use one-based `partNumber` values and keep the
+    /// ETags in part order. Abort the upload if it cannot be completed.
+    ///
+    /// ```no_run
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// use object_store::{
+    ///     aws::AmazonS3Builder,
+    ///     multipart::{MultipartStore, PartId},
+    ///     path::Path,
+    ///     signer::{Method, SignedUrlOptions, Signer},
+    /// };
+    /// use std::time::Duration;
+    ///
+    /// let store = AmazonS3Builder::from_env().build()?;
+    /// let path = Path::from("large-file");
+    /// let upload_id = store.create_multipart(&path).await?;
+    /// let mut parts = Vec::new();
+    /// for part_number in 1..=2 {
+    ///     let options = SignedUrlOptions::new().with_query([
+    ///         ("partNumber", part_number.to_string()),
+    ///         ("uploadId", upload_id.clone()),
+    ///     ]);
+    ///     let url = store
+    ///         .signed_url_opts(Method::PUT, &path, Duration::from_secs(3600), &options)
+    ///         .await?;
+    ///
+    ///     // Run on the client without credentials; return the ETag to the credential holder.
+    ///     let response = reqwest::Client::new()
+    ///         .put(url)
+    ///         .body(vec![0_u8; 5 * 1024 * 1024])
+    ///         .send().await?
+    ///         .error_for_status()?;
+    ///     let content_id = response.headers()[http::header::ETAG].to_str()?.to_owned();
+    ///     parts.push(PartId { content_id });
+    /// }
+    /// store.complete_multipart(&path, &upload_id, parts).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     async fn create_multipart(&self, path: &Path) -> Result<MultipartId> {
         self.client
             .create_multipart(path, PutMultipartOptions::default())
