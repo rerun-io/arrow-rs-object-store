@@ -97,6 +97,31 @@ impl AmazonS3 {
         &self.client.config.credentials
     }
 
+    /// Completes an upload only if the destination does not exist.
+    ///
+    /// Returns [`Error::AlreadyExists`] if the destination exists at completion.
+    /// Parts must satisfy the same requirements as
+    /// [`MultipartStore::complete_multipart`].
+    /// On failure, the caller is responsible for aborting the upload.
+    pub async fn complete_multipart_if_not_exists(
+        &self,
+        path: &Path,
+        id: &MultipartId,
+        parts: Vec<PartId>,
+    ) -> Result<PutResult> {
+        match self
+            .client
+            .complete_multipart(path, id, parts, CompleteMultipartMode::Create)
+            .await
+        {
+            Err(err @ Error::Precondition { .. }) => Err(Error::AlreadyExists {
+                path: path.to_string(),
+                source: Box::new(err),
+            }),
+            result => result,
+        }
+    }
+
     /// Create a full URL to the resource specified by `path` with this instance's configuration.
     fn path_url(&self, path: &Path) -> String {
         self.client.config.path_url(path)
@@ -592,14 +617,148 @@ mod tests {
     use crate::ObjectStoreExt;
     use crate::client::SpawnedReqwestConnector;
     use crate::client::get::GetClient;
+    use crate::client::mock_server::MockServer;
     use crate::client::retry::RetryContext;
     use crate::integration::*;
     use crate::tests::*;
     use base64::Engine;
     use base64::prelude::BASE64_STANDARD;
-    use http::HeaderMap;
+    use http::{HeaderMap, Response};
 
     const NON_EXISTENT_NAME: &str = "nonexistentname";
+
+    fn mock_s3(mock: &MockServer) -> AmazonS3 {
+        AmazonS3Builder::new()
+            .with_bucket_name("test-bucket")
+            .with_region("us-east-1")
+            .with_access_key_id("key")
+            .with_secret_access_key("secret")
+            .with_endpoint(mock.url())
+            .with_allow_http(true)
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_complete_multipart_modes() {
+        for create in [false, true] {
+            let mock = MockServer::new().await;
+            let store = mock_s3(&mock);
+            mock.push_fn(move |req| {
+                assert_eq!(req.method(), Method::POST);
+                assert_eq!(req.uri().path(), "/test-bucket/test");
+                assert_eq!(req.uri().query(), Some("uploadId=test-upload-id"));
+                assert_eq!(
+                    req.headers().get(IF_NONE_MATCH).map(|v| v.to_str().unwrap()),
+                    create.then_some("*")
+                );
+                Response::builder()
+                    .header("x-amz-version-id", "test-version")
+                    .body(
+                        "<CompleteMultipartUploadResult><ETag>\"test-etag\"</ETag></CompleteMultipartUploadResult>".to_string(),
+                    )
+                    .unwrap()
+            });
+
+            let path = Path::from("test");
+            let id = "test-upload-id".to_string();
+            let parts = vec![PartId {
+                content_id: "part-etag".to_string(),
+            }];
+            let result = if create {
+                store
+                    .complete_multipart_if_not_exists(&path, &id, parts)
+                    .await
+            } else {
+                store.complete_multipart(&path, &id, parts).await
+            };
+            assert_eq!(
+                result.unwrap(),
+                PutResult {
+                    e_tag: Some("\"test-etag\"".to_string()),
+                    version: Some("test-version".to_string()),
+                }
+            );
+            mock.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_complete_multipart_precondition() {
+        for create in [false, true] {
+            let mock = MockServer::new().await;
+            let store = mock_s3(&mock);
+            mock.push(
+                Response::builder()
+                    .status(StatusCode::PRECONDITION_FAILED)
+                    .body("<Error><Code>PreconditionFailed</Code></Error>".to_string())
+                    .unwrap(),
+            );
+
+            let path = Path::from("test");
+            let id = "test-upload-id".to_string();
+            let parts = vec![PartId {
+                content_id: "part-etag".to_string(),
+            }];
+            let err = if create {
+                store
+                    .complete_multipart_if_not_exists(&path, &id, parts)
+                    .await
+            } else {
+                store.complete_multipart(&path, &id, parts).await
+            }
+            .unwrap_err();
+            if create {
+                let Error::AlreadyExists { path, source } = err else {
+                    panic!("Expected AlreadyExists, got {err}");
+                };
+                assert_eq!(path, "test");
+                assert!(matches!(
+                    source.downcast_ref::<Error>(),
+                    Some(Error::Precondition { path, .. }) if path == "test"
+                ));
+            } else {
+                assert!(matches!(err, Error::Precondition { path, .. } if path == "test"));
+            }
+            mock.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_complete_multipart_if_not_exists_race() {
+        maybe_skip_integration!();
+        let store = AmazonS3Builder::from_env().build().unwrap();
+        let path = Path::from("complete_multipart_if_not_exists");
+        store.delete(&path).await.unwrap();
+
+        let first_id = store.create_multipart(&path).await.unwrap();
+        let second_id = store.create_multipart(&path).await.unwrap();
+        let first_part = store
+            .put_part(&path, &first_id, 0, "first".into())
+            .await
+            .unwrap();
+        let second_part = store
+            .put_part(&path, &second_id, 0, "second".into())
+            .await
+            .unwrap();
+
+        let first = store
+            .complete_multipart_if_not_exists(&path, &first_id, vec![first_part])
+            .await
+            .unwrap();
+        let err = store
+            .complete_multipart_if_not_exists(&path, &second_id, vec![second_part])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::AlreadyExists { .. }), "{err}");
+        store.abort_multipart(&path, &second_id).await.unwrap();
+
+        let result = store.get(&path).await.unwrap();
+        assert_eq!(result.meta.e_tag, first.e_tag);
+        assert_eq!(result.meta.version, first.version);
+        assert_eq!(result.bytes().await.unwrap().as_ref(), b"first");
+        store.delete(&path).await.unwrap();
+    }
 
     #[tokio::test]
     async fn write_multipart_file_with_signature() {
