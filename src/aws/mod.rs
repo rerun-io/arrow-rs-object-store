@@ -97,6 +97,36 @@ impl AmazonS3 {
         &self.client.config.credentials
     }
 
+    // TODO(arrow-rs-object-store/#289): Revisit this S3-only entry point when upstream
+    // exposes conditional multipart uploads through a stable public API.
+    // TODO(arrow-rs-object-store/#396): The replacement must accept conditions at
+    // MultipartStore completion. A mode in PutMultipartOptions alone does not cover
+    // the stateless low-level create/complete flow.
+    /// Completes an upload only if the destination does not exist.
+    ///
+    /// Returns [`Error::AlreadyExists`] if the destination exists at completion.
+    /// Parts must satisfy the same requirements as
+    /// [`MultipartStore::complete_multipart`].
+    /// On failure, the caller is responsible for aborting the upload.
+    pub async fn complete_multipart_if_not_exists(
+        &self,
+        path: &Path,
+        id: &MultipartId,
+        parts: Vec<PartId>,
+    ) -> Result<PutResult> {
+        match self
+            .client
+            .complete_multipart(path, id, parts, CompleteMultipartMode::Create)
+            .await
+        {
+            Err(err @ Error::Precondition { .. }) => Err(Error::AlreadyExists {
+                path: path.to_string(),
+                source: Box::new(err),
+            }),
+            result => result,
+        }
+    }
+
     /// Create a full URL to the resource specified by `path` with this instance's configuration.
     fn path_url(&self, path: &Path) -> String {
         self.client.config.path_url(path)

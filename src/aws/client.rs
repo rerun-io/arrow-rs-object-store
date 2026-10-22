@@ -798,7 +798,9 @@ impl S3Client {
 
         let response = request
             .retryable(&self.config.retry_config)
-            .idempotent(true)
+            // A lost response may hide a successful create. Retrying after a timeout
+            // or interruption could then report our own write as AlreadyExists.
+            .idempotent(matches!(mode, CompleteMultipartMode::Overwrite))
             .retry_error_body(true)
             .send()
             .await
