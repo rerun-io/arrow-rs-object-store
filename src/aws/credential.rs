@@ -20,7 +20,7 @@ use crate::client::builder::HttpRequestBuilder;
 use crate::client::retry::RetryExt;
 use crate::client::token::{TemporaryToken, TokenCache};
 use crate::client::{HttpClient, HttpError, HttpRequest, TokenProvider};
-use crate::util::{hex_digest, hex_encode, hmac_sha256};
+use crate::util::{append_strict_query_pairs, hex_digest, hex_encode, hmac_sha256};
 use crate::{CredentialProvider, Result, RetryConfig};
 use async_trait::async_trait;
 use bytes::Buf;
@@ -249,9 +249,31 @@ impl<'a> AwsAuthorizer<'a> {
             .insert(&AUTHORIZATION, authorization_val);
     }
 
-    pub(crate) fn sign(&self, method: Method, url: &mut Url, expires_in: Duration) {
+    /// The caller must validate query parameters and headers with `validate_signed_url_extras`.
+    pub(crate) fn sign_with(
+        &self,
+        method: Method,
+        url: &mut Url,
+        extra_query: &[(String, String)],
+        signed_headers: &HeaderMap,
+        expires_in: Duration,
+    ) -> Result<()> {
         let date = self.date.unwrap_or_else(Utc::now);
         let scope = self.scope(date);
+
+        append_strict_query_pairs(url, extra_query);
+
+        let host = &url[url::Position::BeforeHost..url::Position::AfterPort];
+        let host_val = HeaderValue::from_str(host).map_err(|err| crate::Error::Generic {
+            store: STORE,
+            source: Box::new(err),
+        })?;
+        let mut headers = HeaderMap::with_capacity(1 + signed_headers.len());
+        headers.insert(HOST, host_val);
+        for (name, value) in signed_headers {
+            headers.append(name.clone(), value.clone());
+        }
+        let (signed_headers, canonical_headers) = canonicalize_headers(&headers);
 
         // https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-query-string-auth.html
         url.query_pairs_mut()
@@ -262,7 +284,7 @@ impl<'a> AwsAuthorizer<'a> {
             )
             .append_pair("X-Amz-Date", &date.format("%Y%m%dT%H%M%SZ").to_string())
             .append_pair("X-Amz-Expires", &expires_in.as_secs().to_string())
-            .append_pair("X-Amz-SignedHeaders", "host");
+            .append_pair("X-Amz-SignedHeaders", &signed_headers);
 
         if self.request_payer {
             // For signed URLs, include x-amz-request-payer=requester in the request
@@ -281,13 +303,6 @@ impl<'a> AwsAuthorizer<'a> {
         // We don't have a payload; the user is going to send the payload directly themselves.
         let digest = UNSIGNED_PAYLOAD;
 
-        let host = &url[url::Position::BeforeHost..url::Position::AfterPort].to_string();
-        let mut headers = HeaderMap::new();
-        let host_val = HeaderValue::from_str(host).unwrap();
-        headers.insert("host", host_val);
-
-        let (signed_headers, canonical_headers) = canonicalize_headers(&headers);
-
         let string_to_sign = self.string_to_sign(
             date,
             &scope,
@@ -304,6 +319,7 @@ impl<'a> AwsAuthorizer<'a> {
 
         url.query_pairs_mut()
             .append_pair("X-Amz-Signature", &signature);
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -389,6 +405,8 @@ impl CredentialExt for HttpRequestBuilder {
 
 /// Canonicalizes query parameters into the AWS canonical form
 ///
+/// Sort by encoded name, then encoded value, as required by SigV4.
+///
 /// <https://docs.aws.amazon.com/general/latest/gr/sigv4-create-canonical-request.html>
 fn canonicalize_query(url: &Url) -> String {
     use std::fmt::Write;
@@ -397,23 +415,24 @@ fn canonicalize_query(url: &Url) -> String {
         Some(q) if !q.is_empty() => q.len(),
         _ => return String::new(),
     };
+
+    let mut params = url
+        .query_pairs()
+        .map(|(k, v)| {
+            (
+                utf8_percent_encode(k.as_ref(), &STRICT_ENCODE_SET).to_string(),
+                utf8_percent_encode(v.as_ref(), &STRICT_ENCODE_SET).to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    params.sort_unstable();
+
     let mut encoded = String::with_capacity(capacity + 1);
-
-    let mut headers = url.query_pairs().collect::<Vec<_>>();
-    headers.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
-
-    let mut first = true;
-    for (k, v) in headers {
-        if !first {
+    for (i, (k, v)) in params.iter().enumerate() {
+        if i > 0 {
             encoded.push('&');
         }
-        first = false;
-        let _ = write!(
-            encoded,
-            "{}={}",
-            utf8_percent_encode(k.as_ref(), &STRICT_ENCODE_SET),
-            utf8_percent_encode(v.as_ref(), &STRICT_ENCODE_SET)
-        );
+        let _ = write!(encoded, "{k}={v}");
     }
     encoded
 }
@@ -941,7 +960,6 @@ mod tests {
             .unwrap();
         let signer = AwsAuthorizer {
             date: Some(date),
-            crypto: None,
             credential: &credential,
             service: "ec2",
             region: "us-east-1",
@@ -950,7 +968,7 @@ mod tests {
             request_payer: false,
         };
 
-        signer.try_authorize(&mut request, None).unwrap();
+        signer.authorize(&mut request, None);
 
         // host is signed ...
         let auth = request
@@ -1077,7 +1095,15 @@ mod tests {
         };
 
         let mut url = Url::parse("https://examplebucket.s3.amazonaws.com/test.txt").unwrap();
-        authorizer.sign(Method::GET, &mut url, Duration::from_secs(86400));
+        authorizer
+            .sign_with(
+                Method::GET,
+                &mut url,
+                &[],
+                &HeaderMap::new(),
+                Duration::from_secs(86400),
+            )
+            .unwrap();
 
         assert_eq!(
             url,
@@ -1118,7 +1144,15 @@ mod tests {
         };
 
         let mut url = Url::parse("https://examplebucket.s3.amazonaws.com/test.txt").unwrap();
-        authorizer.sign(Method::GET, &mut url, Duration::from_secs(86400));
+        authorizer
+            .sign_with(
+                Method::GET,
+                &mut url,
+                &[],
+                &HeaderMap::new(),
+                Duration::from_secs(86400),
+            )
+            .unwrap();
 
         assert_eq!(
             url,
@@ -1134,6 +1168,85 @@ mod tests {
             )
             .unwrap()
         );
+    }
+
+    #[test]
+    fn signed_url_with_options() {
+        use crate::signer::SignedUrlOptions;
+
+        let credential = AwsCredential {
+            key_id: "AKIAIOSFODNN7EXAMPLE".into(),
+            secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".into(),
+            token: None,
+        };
+        let authorizer = AwsAuthorizer {
+            date: Some(
+                DateTime::parse_from_rfc3339("2013-05-24T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+            credential: &credential,
+            service: "s3",
+            region: "us-east-1",
+            token_header: None,
+            sign_payload: false,
+            request_payer: false,
+        };
+
+        for (options, query_prefix, signed_headers, signature) in [
+            (
+                SignedUrlOptions::new().with_query([("prefix", "a b")]),
+                "prefix=a%20b&",
+                "host",
+                "e392940dfa4480f872625b35ef1224bfa1ae989c73874df01022e6d1fa4c2f00",
+            ),
+            (
+                SignedUrlOptions::new().with_query([("partNumber", "2"), ("partNumber", "1")]),
+                "partNumber=2&partNumber=1&",
+                "host",
+                "d3d68662bef0097adce4878c453f22ce9449c7084789b03d9abe9e8c05db38e7",
+            ),
+            (
+                SignedUrlOptions::new().with_query([("partNumber", "1"), ("uploadId", "abc123")]),
+                "partNumber=1&uploadId=abc123&",
+                "host",
+                "4fb562e4da520986ae14e0e0259e2a2355625743452bb3c0ab8a6b50d8f0fcd4",
+            ),
+            (
+                SignedUrlOptions::new().with_signed_header(
+                    http::header::CONTENT_TYPE,
+                    HeaderValue::from_static("text/plain"),
+                ),
+                "",
+                "content-type%3Bhost",
+                "653d5b202899172830dfe331b817de16c682b8b1e366de1b251ae709a20e20f9",
+            ),
+        ] {
+            let mut url = Url::parse("https://examplebucket.s3.amazonaws.com/test.txt").unwrap();
+            authorizer
+                .sign_with(
+                    Method::PUT,
+                    &mut url,
+                    &options.extra_query,
+                    &options.signed_headers,
+                    Duration::from_secs(86400),
+                )
+                .unwrap();
+
+            assert_eq!(
+                url.as_str(),
+                format!(
+                    "https://examplebucket.s3.amazonaws.com/test.txt?{query_prefix}\
+                    X-Amz-Algorithm=AWS4-HMAC-SHA256&\
+                    X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&\
+                    X-Amz-Date=20130524T000000Z&\
+                    X-Amz-Expires=86400&\
+                    X-Amz-SignedHeaders={signed_headers}&\
+                    X-Amz-Signature={signature}"
+                ),
+                "{options:?}"
+            );
+        }
     }
 
     #[test]

@@ -39,7 +39,8 @@ use std::time::Duration;
 
 use crate::client::CredentialProvider;
 use crate::gcp::credential::GCSAuthorizer;
-use crate::signer::Signer;
+use crate::signer::{SignedUrlOptions, Signer};
+use crate::util::validate_signed_url_extras;
 use crate::{CopyMode, CopyOptions};
 use crate::{
     GetOptions, GetResult, ListResult, MultipartId, MultipartUpload, ObjectMeta, ObjectStore,
@@ -264,6 +265,24 @@ impl MultipartStore for GoogleCloudStorage {
 #[async_trait]
 impl Signer for GoogleCloudStorage {
     async fn signed_url(&self, method: Method, path: &Path, expires_in: Duration) -> Result<Url> {
+        self.signed_url_opts(method, path, expires_in, &SignedUrlOptions::default())
+            .await
+    }
+
+    async fn signed_url_opts(
+        &self,
+        method: Method,
+        path: &Path,
+        expires_in: Duration,
+        options: &SignedUrlOptions,
+    ) -> Result<Url> {
+        validate_signed_url_extras(
+            STORE,
+            &options.extra_query,
+            &options.signed_headers,
+            "x-goog-",
+        )?;
+
         if expires_in.as_secs() > 604800 {
             return Err(crate::Error::Generic {
                 store: STORE,
@@ -282,7 +301,14 @@ impl Signer for GoogleCloudStorage {
         let authorizer = GCSAuthorizer::new(signing_credentials);
 
         authorizer
-            .sign(method, &mut url, expires_in, &self.client)
+            .sign_with(
+                method,
+                &mut url,
+                &options.extra_query,
+                &options.signed_headers,
+                expires_in,
+                &self.client,
+            )
             .await?;
 
         Ok(url)
@@ -326,7 +352,14 @@ impl Signer for GoogleCloudStorage {
                 })?;
 
                 authorizer
-                    .sign(method.clone(), &mut url, expires_in, client)
+                    .sign_with(
+                        method.clone(),
+                        &mut url,
+                        &[],
+                        &http::HeaderMap::new(),
+                        expires_in,
+                        client,
+                    )
                     .await?;
 
                 Ok::<_, crate::Error>(url)

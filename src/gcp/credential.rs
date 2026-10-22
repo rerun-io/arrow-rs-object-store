@@ -21,7 +21,7 @@ use crate::client::retry::RetryExt;
 use crate::client::token::TemporaryToken;
 use crate::client::{HttpClient, HttpError, TokenProvider};
 use crate::gcp::{GcpSigningCredentialProvider, STORE};
-use crate::util::{STRICT_ENCODE_SET, hex_digest, hex_encode};
+use crate::util::{STRICT_ENCODE_SET, append_strict_query_pairs, hex_digest, hex_encode};
 use crate::{RetryConfig, StaticCredentialProvider};
 use async_trait::async_trait;
 use base64::Engine;
@@ -736,11 +736,9 @@ impl TokenProvider for AuthorizedUserCredentials {
     }
 }
 
-/// Trim whitespace from header values
+/// Trim and collapse whitespace as required by GCS canonical requests.
 fn trim_header_value(value: &str) -> String {
-    let mut ret = value.to_string();
-    ret.retain(|c| !c.is_whitespace());
-    ret
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// A Google Cloud Storage Authorizer for generating signed URL using [Google SigV4]
@@ -761,10 +759,13 @@ impl GCSAuthorizer {
         }
     }
 
-    pub(crate) async fn sign(
+    /// The caller must validate query parameters and headers with `validate_signed_url_extras`.
+    pub(crate) async fn sign_with(
         &self,
         method: Method,
         url: &mut Url,
+        extra_query: &[(String, String)],
+        signed_headers: &HeaderMap,
         expires_in: Duration,
         client: &GoogleCloudStorageClient,
     ) -> crate::Result<()> {
@@ -773,8 +774,16 @@ impl GCSAuthorizer {
         let scope = self.scope(date);
         let credential_with_scope = format!("{email}/{scope}");
 
-        let mut headers = HeaderMap::new();
-        headers.insert("host", DEFAULT_GCS_SIGN_BLOB_HOST.parse().unwrap());
+        append_strict_query_pairs(url, extra_query);
+
+        let mut headers = HeaderMap::with_capacity(1 + signed_headers.len());
+        headers.insert(
+            "host",
+            http::HeaderValue::from_static(DEFAULT_GCS_SIGN_BLOB_HOST),
+        );
+        for (name, value) in signed_headers {
+            headers.append(name.clone(), value.clone());
+        }
 
         let (_, signed_headers) = Self::canonicalize_headers(&headers);
 
@@ -833,14 +842,14 @@ impl GCSAuthorizer {
     /// <https://cloud.google.com/storage/docs/authentication/canonical-requests#about-query-strings>
     fn canonicalize_query(url: &Url) -> String {
         url.query_pairs()
-            .sorted_unstable_by(|a, b| a.0.cmp(&b.0))
             .map(|(k, v)| {
-                format!(
-                    "{}={}",
-                    utf8_percent_encode(k.as_ref(), &STRICT_ENCODE_SET),
-                    utf8_percent_encode(v.as_ref(), &STRICT_ENCODE_SET)
+                (
+                    utf8_percent_encode(k.as_ref(), &STRICT_ENCODE_SET).to_string(),
+                    utf8_percent_encode(v.as_ref(), &STRICT_ENCODE_SET).to_string(),
                 )
             })
+            .sorted_unstable()
+            .map(|(k, v)| format!("{k}={v}"))
             .join("&")
     }
 
@@ -931,14 +940,17 @@ mod tests {
     #[test]
     fn test_canonicalize_headers() {
         let mut input_header = HeaderMap::new();
-        input_header.insert("content-type", "text/plain".parse().unwrap());
+        input_header.insert(
+            "content-type",
+            "  text/plain;  charset=utf-8  ".parse().unwrap(),
+        );
         input_header.insert("host", "storage.googleapis.com".parse().unwrap());
         input_header.insert("x-goog-meta-reviewer", "jane".parse().unwrap());
         input_header.append("x-goog-meta-reviewer", "john".parse().unwrap());
         assert_eq!(
             GCSAuthorizer::canonicalize_headers(&input_header),
             (
-                "content-type:text/plain
+                "content-type:text/plain; charset=utf-8
 host:storage.googleapis.com
 x-goog-meta-reviewer:jane,john"
                     .into(),
@@ -957,5 +969,129 @@ x-goog-meta-reviewer:jane,john"
             GCSAuthorizer::canonicalize_query(&url),
             "max-keys=2&prefix=object".to_string()
         );
+
+        append_strict_query_pairs(
+            &mut url,
+            &[
+                ("prefix".into(), "a b".into()),
+                ("é".into(), "+/=".into()),
+                ("prefix".into(), "a+b".into()),
+            ],
+        );
+        assert_eq!(
+            GCSAuthorizer::canonicalize_query(&url),
+            "%C3%A9=%2B%2F%3D&max-keys=2&prefix=a%20b&prefix=a%2Bb&prefix=object"
+        );
+    }
+
+    #[derive(Debug)]
+    struct SignBlobService {
+        expected_payload: String,
+    }
+
+    #[async_trait]
+    impl crate::client::HttpService for SignBlobService {
+        async fn call(
+            &self,
+            request: crate::client::HttpRequest,
+        ) -> std::result::Result<crate::client::HttpResponse, HttpError> {
+            use base64::prelude::BASE64_STANDARD;
+
+            assert_eq!(request.method(), Method::POST);
+            assert_eq!(
+                request.uri().to_string(),
+                "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/service-account@example.com:signBlob"
+            );
+            let body: serde_json::Value =
+                serde_json::from_slice(request.body().as_bytes().unwrap()).unwrap();
+            assert_eq!(
+                body["payload"],
+                BASE64_STANDARD.encode(&self.expected_payload)
+            );
+            Ok(http::Response::new(
+                r#"{"signedBlob":"AAECq80="}"#.to_string().into(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn signed_url_with_query_and_headers() {
+        use crate::gcp::client::GoogleCloudStorageConfig;
+        use crate::signer::SignedUrlOptions;
+
+        let credential = Arc::new(GcpSigningCredential {
+            email: "service-account@example.com".into(),
+            private_key: None,
+        });
+        let authorizer = GCSAuthorizer {
+            date: Some(
+                DateTime::parse_from_rfc3339("2013-05-24T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+            credential: Arc::clone(&credential),
+        };
+        let config = GoogleCloudStorageConfig {
+            base_url: DEFAULT_GCS_BASE_URL.into(),
+            credentials: Arc::new(StaticCredentialProvider::new(GcpCredential {
+                bearer: "bearer".into(),
+            })),
+            signing_credentials: Arc::new(StaticCredentialProvider::new(GcpSigningCredential {
+                email: credential.email.clone(),
+                private_key: None,
+            })),
+            bucket_name: "bucket".into(),
+            retry_config: RetryConfig::default(),
+            client_options: crate::ClientOptions::default(),
+            skip_signature: false,
+        };
+        let query = concat!(
+            "X-Goog-Algorithm=GOOG4-RSA-SHA256&",
+            "X-Goog-Credential=service-account%40example.com%2F20130524%2Fauto%2Fstorage%2Fgoog4_request&",
+            "X-Goog-Date=20130524T000000Z&",
+            "X-Goog-Expires=60&",
+            "X-Goog-SignedHeaders=content-type%3Bhost&",
+            "partNumber=1&uploadId=a%20b%2Bc%2F%3D"
+        );
+        let canonical_request = format!(
+            "PUT\n/bucket/object\n{query}\ncontent-type:text/plain; charset=utf-8\nhost:storage.googleapis.com\n\ncontent-type;host\nUNSIGNED-PAYLOAD"
+        );
+        let digest = hex_digest(canonical_request.as_bytes());
+        let client = GoogleCloudStorageClient::new(
+            config,
+            HttpClient::new(SignBlobService {
+                expected_payload: format!(
+                    "GOOG4-RSA-SHA256\n20130524T000000Z\n20130524/auto/storage/goog4_request\n{digest}"
+                ),
+            }),
+        )
+        .unwrap();
+        let options = SignedUrlOptions::new()
+            .with_query([("partNumber", "1"), ("uploadId", "a b+c/=")])
+            .with_signed_header(
+                http::header::CONTENT_TYPE,
+                http::HeaderValue::from_static("  text/plain;  charset=utf-8  "),
+            );
+        let mut url = Url::parse("https://storage.googleapis.com/bucket/object").unwrap();
+        authorizer
+            .sign_with(
+                Method::PUT,
+                &mut url,
+                &options.extra_query,
+                &options.signed_headers,
+                Duration::from_secs(60),
+                &client,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(url.path(), "/bucket/object");
+        let signature = url
+            .query_pairs()
+            .find(|(name, _)| name == "X-Goog-Signature")
+            .unwrap()
+            .1;
+        assert_eq!(signature, "000102abcd");
+        assert!(url.query().unwrap().contains("uploadId=a%20b%2Bc%2F%3D"));
     }
 }
