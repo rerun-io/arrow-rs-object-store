@@ -37,6 +37,7 @@
 //! enabled by setting [crate::ClientConfigKey::Http1Only] to false.
 //!
 //! [lifecycle rule]: https://cloud.google.com/storage/docs/lifecycle#abort-mpu
+use std::num::NonZeroUsize;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
@@ -415,11 +416,14 @@ impl Signer for GoogleCloudStorage {
 
         let config = self.client.config();
 
-        static PARALLELISM: LazyLock<usize> = LazyLock::new(|| {
-            std::env::var("OBJECT_STORE_GCP_SIGNER_PARALLELISM")
-                .map(|value| value.parse().expect("Invalid parallelism value"))
-                .unwrap_or(64)
-        });
+        static PARALLELISM: LazyLock<std::result::Result<NonZeroUsize, String>> =
+            LazyLock::new(|| {
+                parse_signer_parallelism(std::env::var("OBJECT_STORE_GCP_SIGNER_PARALLELISM"))
+            });
+        let parallelism = PARALLELISM.as_ref().map_err(|err| crate::Error::Generic {
+            store: STORE,
+            source: err.clone().into(),
+        })?;
 
         let client = &self.client;
 
@@ -448,7 +452,7 @@ impl Signer for GoogleCloudStorage {
 
                 Ok::<_, crate::Error>(url)
             })
-            .buffered(*PARALLELISM)
+            .buffered(parallelism.get())
             .try_collect()
             .await?;
 
@@ -477,6 +481,21 @@ impl PaginatedListStore for GoogleCloudStorage {
     }
 }
 
+fn parse_signer_parallelism(
+    value: std::result::Result<String, std::env::VarError>,
+) -> std::result::Result<NonZeroUsize, String> {
+    let value = match value {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => "64".into(),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err("OBJECT_STORE_GCP_SIGNER_PARALLELISM must be valid Unicode".into());
+        }
+    };
+    value.parse::<NonZeroUsize>().map_err(|err| {
+        format!("OBJECT_STORE_GCP_SIGNER_PARALLELISM must be a positive usize: {err}")
+    })
+}
+
 #[cfg(test)]
 mod test {
     use credential::DEFAULT_GCS_BASE_URL;
@@ -488,6 +507,18 @@ mod test {
     use super::*;
 
     const NON_EXISTENT_NAME: &str = "nonexistentname";
+
+    #[test]
+    fn signer_parallelism() {
+        assert_eq!(
+            parse_signer_parallelism(Err(std::env::VarError::NotPresent))
+                .unwrap()
+                .get(),
+            64
+        );
+        let err = parse_signer_parallelism(Ok("0".into())).unwrap_err();
+        assert!(err.contains("OBJECT_STORE_GCP_SIGNER_PARALLELISM"));
+    }
 
     #[tokio::test]
     async fn gcs_test() {
