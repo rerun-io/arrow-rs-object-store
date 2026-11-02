@@ -1172,6 +1172,133 @@ x-goog-meta-reviewer:jane,john"
             GCSAuthorizer::canonicalize_query(&url),
             "max-keys=2&prefix=object".to_string()
         );
+
+        append_strict_query_pairs(
+            &mut url,
+            &[
+                ("prefix".into(), "a b".into()),
+                ("é".into(), "+/=".into()),
+                ("prefix".into(), "a+b".into()),
+            ],
+        );
+        assert_eq!(
+            GCSAuthorizer::canonicalize_query(&url),
+            "%C3%A9=%2B%2F%3D&max-keys=2&prefix=a%20b&prefix=a%2Bb&prefix=object"
+        );
+    }
+
+    #[derive(Debug)]
+    struct SignBlobService {
+        expected_payload: String,
+    }
+
+    #[async_trait]
+    impl crate::client::HttpService for SignBlobService {
+        async fn call(
+            &self,
+            request: crate::client::HttpRequest,
+        ) -> std::result::Result<crate::client::HttpResponse, HttpError> {
+            use base64::prelude::BASE64_STANDARD;
+
+            assert_eq!(request.method(), Method::POST);
+            assert_eq!(
+                request.uri().to_string(),
+                "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/service-account@example.com:signBlob"
+            );
+            let body: serde_json::Value =
+                serde_json::from_slice(request.body().as_bytes().unwrap()).unwrap();
+            assert_eq!(
+                body["payload"],
+                BASE64_STANDARD.encode(&self.expected_payload)
+            );
+            Ok(http::Response::new(
+                r#"{"signedBlob":"AAECq80="}"#.to_string().into(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn signed_url_with_query_and_headers() {
+        use crate::gcp::client::GoogleCloudStorageConfig;
+        use crate::signer::SignedUrlOptions;
+
+        let credential = Arc::new(GcpSigningCredential {
+            email: "service-account@example.com".into(),
+            private_key: None,
+        });
+        let authorizer = GCSAuthorizer {
+            date: Some(
+                DateTime::parse_from_rfc3339("2013-05-24T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+            credential: Arc::clone(&credential),
+        };
+        let config = GoogleCloudStorageConfig {
+            base_url: DEFAULT_GCS_BASE_URL.into(),
+            credentials: Arc::new(StaticCredentialProvider::new(GcpCredential {
+                bearer: "bearer".into(),
+            })),
+            signing_credentials: Arc::new(StaticCredentialProvider::new(GcpSigningCredential {
+                email: credential.email.clone(),
+                private_key: None,
+            })),
+            crypto: None,
+            bucket_name: "bucket".into(),
+            retry_config: RetryConfig::default(),
+            client_options: crate::ClientOptions::default(),
+            skip_signature: false,
+        };
+        let query = concat!(
+            "X-Goog-Algorithm=GOOG4-RSA-SHA256&",
+            "X-Goog-Credential=service-account%40example.com%2F20130524%2Fauto%2Fstorage%2Fgoog4_request&",
+            "X-Goog-Date=20130524T000000Z&",
+            "X-Goog-Expires=60&",
+            "X-Goog-SignedHeaders=content-type%3Bhost&",
+            "partNumber=1&uploadId=a%20b%2Bc%2F%3D"
+        );
+        let canonical_request = format!(
+            "PUT\n/bucket/object\n{query}\ncontent-type:text/plain; charset=utf-8\nhost:storage.googleapis.com\n\ncontent-type;host\nUNSIGNED-PAYLOAD"
+        );
+        let crypto = crate::client::crypto_provider(None).unwrap();
+        let digest = hex_digest(crypto, canonical_request.as_bytes()).unwrap();
+        let client = GoogleCloudStorageClient::new(
+            config,
+            HttpClient::new(SignBlobService {
+                expected_payload: format!(
+                    "GOOG4-RSA-SHA256\n20130524T000000Z\n20130524/auto/storage/goog4_request\n{digest}"
+                ),
+            }),
+        )
+        .unwrap();
+        let options = SignedUrlOptions::new()
+            .with_query([("partNumber", "1"), ("uploadId", "a b+c/=")])
+            .with_signed_header(
+                http::header::CONTENT_TYPE,
+                http::HeaderValue::from_static("  text/plain;  charset=utf-8  "),
+            );
+        let mut url = Url::parse("https://storage.googleapis.com/bucket/object").unwrap();
+        authorizer
+            .sign_with(
+                crypto,
+                Method::PUT,
+                &mut url,
+                &options.extra_query,
+                &options.signed_headers,
+                Duration::from_secs(60),
+                &client,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(url.path(), "/bucket/object");
+        let signature = url
+            .query_pairs()
+            .find(|(name, _)| name == "X-Goog-Signature")
+            .unwrap()
+            .1;
+        assert_eq!(signature, "000102abcd");
+        assert!(url.query().unwrap().contains("uploadId=a%20b%2Bc%2F%3D"));
     }
 
     #[test]
